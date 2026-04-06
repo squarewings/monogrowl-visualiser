@@ -1,0 +1,18 @@
+# Dependencies and build cache
+node_modules/
+.wrangler/
+
+# Large media files (served from dist but not tracked in git)
+*.mp4
+*.mov
+*.webm
+*.mp3
+*.aiff
+*.wav
+
+# Rendered frames
+rec-frames/
+
+# Environment and secrets
+.env
+.env.*
