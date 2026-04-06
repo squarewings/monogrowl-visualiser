@@ -16,3 +16,4 @@ rec-frames/
 # Environment and secrets
 .env
 .env.*
+dist/

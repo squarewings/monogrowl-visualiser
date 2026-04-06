@@ -220,6 +220,7 @@
 
 <canvas id="viz" style="display:none;"></canvas>
 <canvas id="gl" style="position:fixed;top:0;left:0;"></canvas>
+<canvas id="crt2d" style="position:fixed;top:0;left:0;pointer-events:none;display:none;z-index:5;"></canvas>
 
 <!-- Record UI removed — use server-side rendering for share videos -->
 <div class="share-overlay" id="shareOverlay" style="display:none;"></div>
@@ -250,14 +251,131 @@
 <script>
 const canvas = document.getElementById('viz');
 const ctx = canvas.getContext('2d');
+const crt2dCanvas = document.getElementById('crt2d');
 let W, H;
 
 function resize() {
   W = canvas.width = window.innerWidth;
   H = canvas.height = window.innerHeight;
+  crt2dCanvas.width = window.innerWidth;
+  crt2dCanvas.height = window.innerHeight;
 }
 resize();
 window.addEventListener('resize', resize);
+
+// 2D CRT overlay — WebGL-powered post-processing for canvas modes
+let crt2dGL, crt2dProgram, crt2dTexture, crt2dReady = false;
+function initCRT2D() {
+  const gl = crt2dCanvas.getContext('webgl', { premultipliedAlpha: false, alpha: true });
+  if (!gl) return;
+  crt2dGL = gl;
+
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, `
+    attribute vec2 pos;
+    varying vec2 vUv;
+    void main() {
+      vUv = pos * 0.5 + 0.5;
+      gl_Position = vec4(pos, 0.0, 1.0);
+    }`);
+  gl.compileShader(vs);
+
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, `
+    precision highp float;
+    uniform sampler2D uTex;
+    uniform float uTime;
+    uniform vec2 uRes;
+    uniform float uBass;
+    varying vec2 vUv;
+
+    vec2 barrelDistort(vec2 uv, float k) {
+      vec2 p = uv * 2.0 - 1.0;
+      float r2 = dot(p, p);
+      p *= 1.0 + k * r2;
+      return p * 0.5 + 0.5;
+    }
+    float hash(vec2 p) {
+      vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+      p3 += dot(p3, p3.yzx + 33.33);
+      return fract((p3.x + p3.y) * p3.z);
+    }
+    void main() {
+      vec2 uv = barrelDistort(vUv, 0.04);
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return;
+      }
+      vec2 fromCentre = (uv - 0.5) * 2.0;
+      float edgeDist = dot(fromCentre, fromCentre);
+      float chromaBase = 0.002 * (1.0 + edgeDist * 2.5);
+      float bassBoost = uBass * uBass * 8.0;
+      float chromaR = chromaBase * (1.0 + bassBoost * 0.6);
+      float chromaB = chromaBase * (1.0 + bassBoost * 2.5);
+      float r = texture2D(uTex, barrelDistort(vUv, 0.04) + vec2(chromaR, chromaR * 0.5)).r;
+      float g = texture2D(uTex, uv).g;
+      float b = texture2D(uTex, barrelDistort(vUv, 0.04) - vec2(chromaB, chromaB * 0.5)).b;
+      float blueBoost = uBass * uBass * 0.18;
+      vec3 color = vec3(r, g, b + blueBoost);
+      float scanY = uv.y * uRes.y * 0.5 * 3.14159;
+      float brightness = dot(color, vec3(0.299, 0.587, 0.114));
+      float beamWidth = 0.5 + brightness * 0.4;
+      float scanline = pow(sin(scanY) * 0.5 + 0.5, 2.0 - beamWidth);
+      color *= 1.0 - scanline * 0.4;
+      float maskX = mod(gl_FragCoord.x, 3.0);
+      vec3 mask = vec3(0.88);
+      if (maskX < 1.0) mask.r = 1.0;
+      else if (maskX < 2.0) mask.g = 1.0;
+      else mask.b = 1.0;
+      color *= mix(vec3(1.0), mask, 0.05);
+      float vig = 1.0 - edgeDist * 0.3;
+      vig = clamp(vig, 0.0, 1.0);
+      color *= smoothstep(0.0, 1.0, vig);
+      color *= 1.0 - 0.012 * sin(uTime * 9.0 + uv.y * 2.0);
+      float grain = hash(uv * uRes + vec2(uTime * 100.0)) * 2.0 - 1.0;
+      color += grain * 0.035;
+      vec2 corner = abs(fromCentre) - vec2(0.95);
+      color *= 1.0 - smoothstep(0.0, 0.06, length(max(corner, 0.0)));
+      gl_FragColor = vec4(max(color, vec3(0.0)), 1.0);
+    }`);
+  gl.compileShader(fs);
+
+  crt2dProgram = gl.createProgram();
+  gl.attachShader(crt2dProgram, vs);
+  gl.attachShader(crt2dProgram, fs);
+  gl.linkProgram(crt2dProgram);
+
+  // Fullscreen quad
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(crt2dProgram, 'pos');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  crt2dTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, crt2dTexture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+  crt2dReady = true;
+}
+
+function renderCRT2D(bassVal) {
+  if (!crt2dReady) initCRT2D();
+  if (!crt2dReady) return;
+  const gl = crt2dGL;
+  gl.viewport(0, 0, crt2dCanvas.width, crt2dCanvas.height);
+  gl.useProgram(crt2dProgram);
+  // Upload the 2D canvas as texture
+  gl.bindTexture(gl.TEXTURE_2D, crt2dTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+  gl.uniform1f(gl.getUniformLocation(crt2dProgram, 'uTime'), time * 0.016);
+  gl.uniform2f(gl.getUniformLocation(crt2dProgram, 'uRes'), crt2dCanvas.width, crt2dCanvas.height);
+  gl.uniform1f(gl.getUniformLocation(crt2dProgram, 'uBass'), bassVal || 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
 
 // Audio setup
 let audioCtx, analyser, source, dataArray, freqArray, audio;
@@ -652,38 +770,186 @@ let cityPath, cityPathT = 0;
 let smoothCityBass = 0, smoothCityMid = 0, smoothCityHigh = 0;
 const CITY_SMOOTH = 0.18;
 
-// Custom shader: Scanlines
-const ScanlineShader = {
-  uniforms: { tDiffuse: { value: null }, intensity: { value: 0.12 }, count: { value: 400.0 } },
+// === CRT UBER-SHADER ===
+// Combines barrel distortion, phosphor mask, scanlines, chromatic aberration,
+// vignette, film grain, and halation bloom into one pass (retro gaming community techniques)
+const CRTShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uTime: { value: 0 },
+    uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+    uBass: { value: 0 },
+    // Effect intensities (all tuneable)
+    uBarrelDistortion: { value: 0.06 },      // Screen curvature
+    uChromatic: { value: 0.0025 },            // RGB separation
+    uScanlineIntensity: { value: 0.4 },       // Scanline darkness (heavy)
+    uScanlineCount: { value: 0.0 },           // 0 = auto from resolution
+    uPhosphorMask: { value: 0.06 },           // RGB sub-pixel grid
+    uVignette: { value: 0.35 },               // Edge darkening
+    uFilmGrain: { value: 0.04 },              // Noise overlay
+    uFlicker: { value: 0.015 },               // CRT brightness flicker
+  },
   vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
   fragmentShader: `
-    uniform sampler2D tDiffuse; uniform float intensity; uniform float count;
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    uniform vec2 uResolution;
+    uniform float uBass;
+    uniform float uBarrelDistortion;
+    uniform float uChromatic;
+    uniform float uScanlineIntensity;
+    uniform float uScanlineCount;
+    uniform float uPhosphorMask;
+    uniform float uVignette;
+    uniform float uFilmGrain;
+    uniform float uFlicker;
     varying vec2 vUv;
+
+    // Barrel distortion — curved CRT screen
+    vec2 barrelDistort(vec2 uv, float k) {
+      vec2 p = uv * 2.0 - 1.0;
+      float r2 = dot(p, p);
+      p *= 1.0 + k * r2;
+      return p * 0.5 + 0.5;
+    }
+
+    // Pseudo-random for grain
+    float hash(vec2 p) {
+      vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+      p3 += dot(p3, p3.yzx + 33.33);
+      return fract((p3.x + p3.y) * p3.z);
+    }
+
     void main() {
-      vec4 color = texture2D(tDiffuse, vUv);
-      float scanline = sin(vUv.y * count * 3.14159) * 0.5 + 0.5;
-      color.rgb -= scanline * intensity;
-      gl_FragColor = color;
+      // Apply barrel distortion
+      vec2 uv = barrelDistort(vUv, uBarrelDistortion);
+
+      // Check bounds after distortion (black outside CRT tube)
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+      }
+
+      // Distance from centre (used for edge-based effects)
+      vec2 fromCentre = (uv - 0.5) * 2.0;
+      float edgeDist = dot(fromCentre, fromCentre);
+
+      // Chromatic aberration — stronger at edges + bass-reactive, blue-biased on hits
+      float chromaBase = uChromatic * (1.0 + edgeDist * 2.5);
+      float bassBoost = uBass * uBass * 8.0;
+      float chromaR = chromaBase * (1.0 + bassBoost * 0.6);  // Red moves less
+      float chromaB = chromaBase * (1.0 + bassBoost * 2.5);  // Blue pushes hardest
+      float r = texture2D(tDiffuse, barrelDistort(vUv, uBarrelDistortion) + vec2(chromaR, chromaR * 0.5)).r;
+      float g = texture2D(tDiffuse, uv).g;
+      float b = texture2D(tDiffuse, barrelDistort(vUv, uBarrelDistortion) - vec2(chromaB, chromaB * 0.5)).b;
+      // On heavy bass, boost blue channel intensity for visible blue fringe
+      float blueBoost = uBass * uBass * 0.18;
+      vec3 color = vec3(r, g, b + blueBoost);
+
+      // Scanlines — beam profile with brightness-dependent width
+      float scanCount = uScanlineCount > 0.0 ? uScanlineCount : uResolution.y * 0.5;
+      float scanY = uv.y * scanCount * 3.14159;
+      float brightness = dot(color, vec3(0.299, 0.587, 0.114));
+      float beamWidth = 0.5 + brightness * 0.4;  // Bright pixels = wider beam
+      float scanline = pow(sin(scanY) * 0.5 + 0.5, 2.0 - beamWidth);
+      color *= 1.0 - scanline * uScanlineIntensity;
+
+      // Phosphor mask — aperture grille style (RGB vertical stripes)
+      float maskX = mod(gl_FragCoord.x, 3.0);
+      vec3 mask = vec3(0.85);
+      if (maskX < 1.0) mask.r = 1.0;
+      else if (maskX < 2.0) mask.g = 1.0;
+      else mask.b = 1.0;
+      color *= mix(vec3(1.0), mask, uPhosphorMask);
+
+      // Vignette
+      float vig = 1.0 - edgeDist * uVignette;
+      vig = clamp(vig, 0.0, 1.0);
+      vig = smoothstep(0.0, 1.0, vig);
+      color *= vig;
+
+      // CRT flicker — subtle brightness oscillation
+      float flicker = 1.0 - uFlicker * sin(uTime * 9.0 + uv.y * 2.0);
+      color *= flicker;
+
+      // Film grain
+      float grain = hash(uv * uResolution + vec2(uTime * 100.0)) * 2.0 - 1.0;
+      color += grain * uFilmGrain;
+
+      // Corner shadow (rounded CRT tube edges)
+      vec2 corner = abs(fromCentre) - vec2(0.95);
+      float cornerMask = 1.0 - smoothstep(0.0, 0.06, length(max(corner, 0.0)));
+      color *= cornerMask;
+
+      gl_FragColor = vec4(max(color, 0.0), 1.0);
     }`
 };
 
-// Custom shader: Chromatic aberration
-const ChromaticShader = {
-  uniforms: { tDiffuse: { value: null }, amount: { value: 0.003 } },
+// === AFTERIMAGE / MOTION BLUR SHADER ===
+const AfterimageShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    tOld: { value: null },
+    uDamp: { value: 0.9 }
+  },
   vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
   fragmentShader: `
-    uniform sampler2D tDiffuse; uniform float amount;
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tOld;
+    uniform float uDamp;
     varying vec2 vUv;
     void main() {
-      float r = texture2D(tDiffuse, vUv + vec2(amount, 0.0)).r;
-      float g = texture2D(tDiffuse, vUv).g;
-      float b = texture2D(tDiffuse, vUv - vec2(amount, 0.0)).b;
-      float a = texture2D(tDiffuse, vUv).a;
-      gl_FragColor = vec4(r, g, b, a);
+      vec4 newFrame = texture2D(tDiffuse, vUv);
+      vec4 oldFrame = texture2D(tOld, vUv);
+      gl_FragColor = max(newFrame, oldFrame * uDamp);
     }`
 };
 
-// Custom shader: Vignette
+// Afterimage pass — accumulates previous frames for motion blur
+class AfterimagePass {
+  constructor(damp) {
+    this.shader = AfterimageShader;
+    this.uniforms = THREE.UniformsUtils.clone(this.shader.uniforms);
+    this.uniforms.uDamp.value = damp || 0.9;
+    this.textureComp = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight);
+    this.textureOld = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight);
+    this.shaderMaterial = new THREE.ShaderMaterial({
+      uniforms: this.uniforms,
+      vertexShader: this.shader.vertexShader,
+      fragmentShader: this.shader.fragmentShader
+    });
+    this.compFsQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.shaderMaterial);
+    this.compScene = new THREE.Scene();
+    this.compCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.compScene.add(this.compFsQuad);
+    this.enabled = true;
+    this.renderToScreen = false;
+    this.needsSwap = true;
+  }
+  setSize(w, h) {
+    this.textureComp.setSize(w, h);
+    this.textureOld.setSize(w, h);
+  }
+  render(renderer, writeBuffer, readBuffer) {
+    this.uniforms.tDiffuse.value = readBuffer.texture;
+    this.uniforms.tOld.value = this.textureOld.texture;
+    renderer.setRenderTarget(this.textureComp);
+    renderer.render(this.compScene, this.compCamera);
+    // Copy comp to old for next frame
+    const temp = this.textureOld;
+    this.textureOld = this.textureComp;
+    this.textureComp = temp;
+    if (this.renderToScreen) {
+      renderer.setRenderTarget(null);
+      renderer.render(this.compScene, this.compCamera);
+    } else {
+      renderer.setRenderTarget(writeBuffer);
+      renderer.render(this.compScene, this.compCamera);
+    }
+  }
+}
+
+// Keep simple shaders as fallbacks
 const VignetteShader = {
   uniforms: { tDiffuse: { value: null }, darkness: { value: 1.2 }, offset: { value: 1.0 } },
   vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
@@ -720,6 +986,14 @@ function initCity() {
   const edgesGeos = [];
   const greenMat = new THREE.LineBasicMaterial({ color: 0x33ff33, transparent: true, opacity: 0.7 });
 
+  // Helper: add a box at position and collect its edges
+  function addBox(w, h, d, x, y, z) {
+    const box = new THREE.BoxGeometry(w, h, d);
+    box.translate(x, y, z);
+    edgesGeos.push(new THREE.EdgesGeometry(box));
+    box.dispose();
+  }
+
   for (let gx = 0; gx < gridSize; gx++) {
     for (let gz = 0; gz < gridSize; gz++) {
       // Manhattan-like height distribution: taller in centre
@@ -733,21 +1007,50 @@ function initCity() {
       const skip = (hash - Math.floor(hash));
       if (skip < 0.55) continue;
 
-      // Wide height variation: some low, some towering
+      const bx = gx * cellSize - halfGrid + cellSize / 2;
+      const bz = gz * cellSize - halfGrid + cellSize / 2;
+
+      // Wide height variation
       const roll = Math.random();
       const baseH = roll < 0.3 ? 1 + Math.random() * 4 : roll < 0.7 ? 5 + Math.random() * 18 : 20 + Math.random() * 35;
       const h = baseH + heightBias * Math.random() * 1.5;
       const w = blockSize * (0.5 + Math.random() * 0.5);
       const d = blockSize * (0.5 + Math.random() * 0.5);
 
-      const box = new THREE.BoxGeometry(w, h, d);
-      box.translate(
-        gx * cellSize - halfGrid + cellSize / 2,
-        h / 2,
-        gz * cellSize - halfGrid + cellSize / 2
-      );
-      edgesGeos.push(new THREE.EdgesGeometry(box));
-      box.dispose();
+      // Vary building shape based on a second hash
+      const shapeRoll = Math.random();
+
+      if (shapeRoll < 0.15 && h > 15) {
+        // Stepped/setback tower — 2-3 tiers narrowing upward
+        const tiers = 2 + Math.floor(Math.random() * 2);
+        let tierY = 0;
+        for (let t = 0; t < tiers; t++) {
+          const tierH = h / tiers * (1 + (Math.random() - 0.5) * 0.4);
+          const shrink = 1 - t * 0.25;
+          addBox(w * shrink, tierH, d * shrink, bx, tierY + tierH / 2, bz);
+          tierY += tierH;
+        }
+      } else if (shapeRoll < 0.25 && h > 10) {
+        // L-shaped building — two overlapping boxes
+        addBox(w, h, d * 0.5, bx, h / 2, bz - d * 0.25);
+        const wingH = h * (0.4 + Math.random() * 0.3);
+        addBox(w * 0.5, wingH, d, bx + w * 0.25, wingH / 2, bz);
+      } else if (shapeRoll < 0.35 && h > 25) {
+        // Spire/antenna tower — main body + thin spire on top
+        addBox(w, h, d, bx, h / 2, bz);
+        const spireH = h * (0.3 + Math.random() * 0.5);
+        addBox(w * 0.08, spireH, d * 0.08, bx, h + spireH / 2, bz);
+      } else if (shapeRoll < 0.45 && h > 12) {
+        // Twin tower — two narrow towers side by side
+        const gap = w * 0.15;
+        const tw = (w - gap) / 2;
+        const h2 = h * (0.7 + Math.random() * 0.3);
+        addBox(tw, h, d, bx - tw / 2 - gap / 2, h / 2, bz);
+        addBox(tw, h2, d, bx + tw / 2 + gap / 2, h2 / 2, bz);
+      } else {
+        // Standard box
+        addBox(w, h, d, bx, h / 2, bz);
+      }
     }
   }
 
@@ -860,22 +1163,30 @@ function initCity() {
   );
   cityComposer.addPass(bloomPass);
 
-  const scanlinePass = new THREE.ShaderPass(ScanlineShader);
-  cityComposer.addPass(scanlinePass);
+  // Motion blur (phosphor persistence) — subtle
+  const cityAfterimage = new AfterimagePass(0.7);
+  cityComposer.addPass(cityAfterimage);
 
-  const chromaPass = new THREE.ShaderPass(ChromaticShader);
-  cityComposer.addPass(chromaPass);
-
-  const vignettePass = new THREE.ShaderPass(VignetteShader);
-  cityComposer.addPass(vignettePass);
+  // CRT uber-shader — replaces individual scanline/chromatic/vignette passes
+  const cityCRT = new THREE.ShaderPass(CRTShader);
+  cityCRT.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+  cityComposer.addPass(cityCRT);
 
   cityScene.userData.bloomPass = bloomPass;
+  cityScene.userData.crtPass = cityCRT;
+  cityScene.userData.afterimagePass = cityAfterimage;
 
   window.addEventListener('resize', () => {
     if (!cityCamera || !cityComposer) return;
     cityCamera.aspect = window.innerWidth / window.innerHeight;
     cityCamera.updateProjectionMatrix();
     cityComposer.setSize(window.innerWidth, window.innerHeight);
+    if (cityScene.userData.crtPass) {
+      cityScene.userData.crtPass.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+    }
+    if (cityScene.userData.afterimagePass) {
+      cityScene.userData.afterimagePass.setSize(window.innerWidth, window.innerHeight);
+    }
   });
 }
 
@@ -897,9 +1208,9 @@ function drawWireframeCity() {
     const d = data[i];
     const freqIdx = Math.min(i * binStep, freqArray.length - 1);
     const freqVal = freqArray[freqIdx] / 255;
-    const targetH = d.baseH + freqVal * 40 + smoothCityBass * 15;
+    const targetH = d.baseH + freqVal * 60 + smoothCityBass * 30;
     const currentH = d.mesh.scale.y;
-    d.mesh.scale.y += (targetH - currentH) * 0.15;
+    d.mesh.scale.y += (targetH - currentH) * 0.22;
     d.mesh.position.y = d.mesh.scale.y / 2;
   }
 
@@ -931,6 +1242,13 @@ function drawWireframeCity() {
     bloomPass.strength = 0.6 + smoothCityHigh * 0.4;
   }
 
+  // --- CRT shader audio reactivity ---
+  const cityCRT = cityScene.userData.crtPass;
+  if (cityCRT) {
+    cityCRT.uniforms.uTime.value = time * 0.016;
+    cityCRT.uniforms.uBass.value = smoothCityBass;
+  }
+
   // --- Render with post-processing ---
   renderer.setClearColor(0x000000);
   cityComposer.render();
@@ -939,6 +1257,7 @@ function drawWireframeCity() {
 // === THREE.JS 3D SPHERE MODE ===
 // renderer is shared with city mode (declared above in city init)
 let scene, camera, sphereMesh, sphereGeo, glowMesh, ringMeshes, starField;
+let sphereComposer;
 let glInitialized = false;
 
 // Simplex noise for GPU displacement (Ashima Arts)
@@ -1164,11 +1483,43 @@ function initThreeJS() {
   // Ambient light
   scene.add(new THREE.AmbientLight(0xc8ff00, 0.3));
 
+  // --- Post-processing for sphere mode ---
+  sphereComposer = new THREE.EffectComposer(renderer);
+  sphereComposer.addPass(new THREE.RenderPass(scene, camera));
+
+  const sphereBloom = new THREE.UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.5, 0.4, 0.5
+  );
+  sphereComposer.addPass(sphereBloom);
+
+  const sphereAfterimage = new AfterimagePass(0.72);
+  sphereComposer.addPass(sphereAfterimage);
+
+  const sphereCRT = new THREE.ShaderPass(CRTShader);
+  sphereCRT.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+  // Slightly lighter CRT for sphere but heavy scanlines
+  sphereCRT.uniforms.uBarrelDistortion.value = 0.04;
+  sphereCRT.uniforms.uScanlineIntensity.value = 0.35;
+  sphereCRT.uniforms.uPhosphorMask.value = 0.04;
+  sphereComposer.addPass(sphereCRT);
+
+  scene.userData.bloomPass = sphereBloom;
+  scene.userData.crtPass = sphereCRT;
+  scene.userData.afterimagePass = sphereAfterimage;
+
   window.addEventListener('resize', () => {
     if (!renderer) return;
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    if (sphereComposer) sphereComposer.setSize(window.innerWidth, window.innerHeight);
+    if (scene.userData.crtPass) {
+      scene.userData.crtPass.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
+    }
+    if (scene.userData.afterimagePass) {
+      scene.userData.afterimagePass.setSize(window.innerWidth, window.innerHeight);
+    }
   });
 }
 
@@ -1229,7 +1580,19 @@ function draw3DSphere() {
   camera.position.y = Math.sin(time * 0.005) * 80;
   camera.lookAt(0, 0, 0);
 
-  renderer.render(scene, camera);
+  // CRT shader audio reactivity
+  const sphereCRT = scene.userData.crtPass;
+  if (sphereCRT) {
+    sphereCRT.uniforms.uTime.value = t;
+    sphereCRT.uniforms.uBass.value = smoothBass3D;
+  }
+
+  if (sphereComposer) {
+    renderer.setClearColor(0x080808);
+    sphereComposer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
 }
 
 // Mode switching - show/hide canvases
@@ -1237,11 +1600,13 @@ function updateCanvasVisibility() {
   if (mode === 0 || mode === 6) {
     canvas.style.display = 'none';
     glCanvas.style.display = 'block';
+    crt2dCanvas.style.display = 'none';
     if (mode === 0) initCity();
     if (mode === 6) initThreeJS();
   } else {
     canvas.style.display = 'block';
     glCanvas.style.display = 'none';
+    crt2dCanvas.style.display = 'block'; // CRT overlay for 2D modes
   }
 }
 
@@ -1262,6 +1627,10 @@ function animate() {
       case 4: drawParticles(); break;
       case 5: drawTerrain(); break;
       case 6: draw3DSphere(); break;
+    }
+    // Apply CRT overlay to 2D canvas modes
+    if (mode >= 1 && mode <= 5) {
+      renderCRT2D(getBassEnergy());
     }
   } catch (e) {
     // Recover from draw errors — clear dead particles and continue
